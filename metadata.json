@@ -1,0 +1,6 @@
+{
+  "name": "Glow-A-Eye",
+  "description": "Your Skin. Your Voice. Your Confidence. A voice-first AI skin health companion designed for blind and visually impaired users.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
