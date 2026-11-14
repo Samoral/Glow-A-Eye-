@@ -5,6 +5,28 @@ export type ImageQualityIssue =
   | 'blurry'
   | 'insufficient_skin_area';
 
+export type GuidanceCategory =
+  | 'no_skin_visible'
+  | 'skin_not_framed'
+  | 'quality_insufficient'
+  | 'skin_ready'
+  | 'uncertain';
+
+export type GuidanceCondition =
+  | 'uncertain'
+  | 'too_dark'
+  | 'too_bright'
+  | 'no_skin'
+  | 'move_left'
+  | 'move_right'
+  | 'move_up'
+  | 'move_down'
+  | 'too_far'
+  | 'too_close'
+  | 'unstable'
+  | 'blurry'
+  | 'ready';
+
 export interface ImageQualityMetrics {
   meanLuminance: number;
   darkPixelRatio: number;
@@ -13,6 +35,37 @@ export interface ImageQualityMetrics {
   edgeStrength: number;
   centerSkinRatio: number;
   frameStdDev: number;
+}
+
+export interface LiveGuidanceMetrics extends ImageQualityMetrics {
+  totalSkinRatio: number;
+  leftSkinRatio: number;
+  rightSkinRatio: number;
+  topSkinRatio: number;
+  bottomSkinRatio: number;
+  skinCentroidX: number;
+  skinCentroidY: number;
+  motionScore: number;
+  hasMotionBaseline: boolean;
+}
+
+export interface LiveGuidanceConfig {
+  maxMotionDelta?: number;
+  minCenterSkinRatio?: number;
+  minTotalSkinRatio?: number;
+}
+
+export interface LiveGuidanceEvaluation {
+  checkPerformed: boolean;
+  category: GuidanceCategory;
+  condition: GuidanceCondition;
+  skinConfidence: number;
+  isStable: boolean;
+  instruction: string;
+  statusLabel: string;
+  metrics: LiveGuidanceMetrics | null;
+  snapshot: Float32Array | null;
+  qualityReport: ImageQualityReport;
 }
 
 export interface IndividualCheckResult {
@@ -39,6 +92,28 @@ export interface CapturedPhotoResult {
 
 const ANALYSIS_WIDTH = 320;
 const ANALYSIS_HEIGHT = 240;
+const MOTION_GRID_W = 32;
+const MOTION_GRID_H = 24;
+
+function isSkinTonePixel(r: number, g: number, b: number, yLum: number): boolean {
+  // Inclusive YCbCr skin-tone chrominance detector covering light through deep skin tones
+  const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+  const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+
+  const inWarmSkinChroma =
+    cb >= 75 && cb <= 136 && cr >= 131 && cr <= 182 && r >= b - 4;
+  // Very deep skin under low/cool indoor light can sit near neutral chroma with warm R>=G
+  const inDeepWarmSkin =
+    yLum >= 20 &&
+    yLum <= 110 &&
+    r >= g &&
+    g >= b - 4 &&
+    cr >= 129 &&
+    cb >= 85 &&
+    cb <= 134;
+
+  return inWarmSkinChroma || inDeepWarmSkin;
+}
 
 /**
  * Evaluates a rendered video frame using real pixel-level canvas analysis.
@@ -93,17 +168,7 @@ export function analyzeImageDataQuality(imageData: ImageData): ImageQualityRepor
         centerPixels += 1;
         centerLumSum += yLum;
 
-        // Inclusive YCbCr skin-tone chrominance detector covering light through deep skin tones
-        const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
-        const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-
-        const inWarmSkinChroma =
-          cb >= 75 && cb <= 136 && cr >= 131 && cr <= 182 && r >= b - 4;
-        // Very deep skin under low/cool indoor light can sit near neutral chroma with warm R>=G
-        const inDeepWarmSkin =
-          yLum >= 20 && yLum <= 110 && r >= g && g >= b - 4 && cr >= 129 && cb >= 85 && cb <= 134;
-
-        if (inWarmSkinChroma || inDeepWarmSkin) {
+        if (isSkinTonePixel(r, g, b, yLum)) {
           centerSkinPixels += 1;
         }
       }
@@ -507,3 +572,476 @@ export function evaluateLiveVideoFrame(video: HTMLVideoElement | null): ImageQua
     );
   }
 }
+
+export function buildUncertainLiveGuidance(reason: string): LiveGuidanceEvaluation {
+  return {
+    checkPerformed: false,
+    category: 'uncertain',
+    condition: 'uncertain',
+    skinConfidence: 0,
+    isStable: false,
+    instruction: reason,
+    statusLabel: 'Checking camera feed',
+    metrics: null,
+    snapshot: null,
+    qualityReport: buildUnperformedReport(reason),
+  };
+}
+
+/**
+ * Evaluates a live camera frame for real-time voice guidance:
+ * - Skin visibility & confidence (inclusive YCbCr across skin tones)
+ * - Framing alignment (left/right/up/down centroid & coverage)
+ * - Distance estimation (too far vs. too close)
+ * - Lighting & glare (too dark vs. overexposed)
+ * - Focus sharpness (Laplacian variance + edge strength)
+ * - Motion stability across consecutive frames (32x24 luminance MAD)
+ */
+export function analyzeLiveGuidanceFrame(
+  imageData: ImageData,
+  previousSnapshot: Float32Array | null = null,
+  config: LiveGuidanceConfig = {}
+): LiveGuidanceEvaluation {
+  const qualityReport = analyzeImageDataQuality(imageData);
+  const { data, width, height } = imageData;
+  const totalPixels = width * height;
+
+  if (!data || totalPixels === 0 || !qualityReport.metrics) {
+    return buildUncertainLiveGuidance(
+      'Camera frame is not ready yet. Hold on a moment.'
+    );
+  }
+
+  const maxMotionDelta = config.maxMotionDelta ?? 9.5;
+  const minCenterSkinRatio = config.minCenterSkinRatio ?? 0.34;
+  const minTotalSkinRatio = config.minTotalSkinRatio ?? 0.2;
+
+  const roiLeft = Math.floor(width * 0.225);
+  const roiRight = Math.ceil(width * 0.775);
+  const roiTop = Math.floor(height * 0.225);
+  const roiBottom = Math.ceil(height * 0.775);
+
+  const leftEdgeEnd = Math.floor(width * 0.35);
+  const rightEdgeStart = Math.floor(width * 0.65);
+  const topEdgeEnd = Math.floor(height * 0.35);
+  const bottomEdgeStart = Math.floor(height * 0.65);
+
+  let totalSkinPixels = 0;
+  let leftSkin = 0;
+  let leftTotal = 0;
+  let rightSkin = 0;
+  let rightTotal = 0;
+  let topSkin = 0;
+  let topTotal = 0;
+  let bottomSkin = 0;
+  let bottomTotal = 0;
+  let sumNormX = 0;
+  let sumNormY = 0;
+
+  let centerLumSum = 0;
+  let centerPixels = 0;
+
+  const gridSize = MOTION_GRID_W * MOTION_GRID_H;
+  const gridSums = new Float32Array(gridSize);
+  const gridCounts = new Uint32Array(gridSize);
+
+  for (let y = 0; y < height; y += 1) {
+    const gy = Math.min(MOTION_GRID_H - 1, Math.floor((y * MOTION_GRID_H) / height));
+    const normY = (y / Math.max(1, height - 1)) * 2 - 1;
+    for (let x = 0; x < width; x += 1) {
+      const gx = Math.min(MOTION_GRID_W - 1, Math.floor((x * MOTION_GRID_W) / width));
+      const normX = (x / Math.max(1, width - 1)) * 2 - 1;
+
+      const idx = y * width + x;
+      const p = idx * 4;
+      const r = data[p];
+      const g = data[p + 1];
+      const b = data[p + 2];
+      const yLum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+      const gIdx = gy * MOTION_GRID_W + gx;
+      gridSums[gIdx] += yLum;
+      gridCounts[gIdx] += 1;
+
+      if (x >= roiLeft && x < roiRight && y >= roiTop && y < roiBottom) {
+        centerLumSum += yLum;
+        centerPixels += 1;
+      }
+
+      const isSkin = isSkinTonePixel(r, g, b, yLum);
+      if (isSkin) {
+        totalSkinPixels += 1;
+        sumNormX += normX;
+        sumNormY += normY;
+      }
+
+      if (x < leftEdgeEnd) {
+        leftTotal += 1;
+        if (isSkin) leftSkin += 1;
+      } else if (x >= rightEdgeStart) {
+        rightTotal += 1;
+        if (isSkin) rightSkin += 1;
+      }
+
+      if (y < topEdgeEnd) {
+        topTotal += 1;
+        if (isSkin) topSkin += 1;
+      } else if (y >= bottomEdgeStart) {
+        bottomTotal += 1;
+        if (isSkin) bottomSkin += 1;
+      }
+    }
+  }
+
+  const snapshot = new Float32Array(gridSize);
+  for (let i = 0; i < gridSize; i += 1) {
+    snapshot[i] = gridCounts[i] > 0 ? gridSums[i] / gridCounts[i] : 0;
+  }
+
+  let motionScore = 0;
+  const hasMotionBaseline =
+    previousSnapshot !== null && previousSnapshot.length === gridSize;
+  if (hasMotionBaseline && previousSnapshot) {
+    let diffSum = 0;
+    for (let i = 0; i < gridSize; i += 1) {
+      diffSum += Math.abs(snapshot[i] - previousSnapshot[i]);
+    }
+    motionScore = diffSum / gridSize;
+  }
+
+  const base = qualityReport.metrics;
+  const centerMeanLum = centerPixels > 0 ? centerLumSum / centerPixels : base.meanLuminance;
+  const totalSkinRatio = totalSkinPixels / totalPixels;
+  const leftSkinRatio = leftTotal > 0 ? leftSkin / leftTotal : 0;
+  const rightSkinRatio = rightTotal > 0 ? rightSkin / rightTotal : 0;
+  const topSkinRatio = topTotal > 0 ? topSkin / topTotal : 0;
+  const bottomSkinRatio = bottomTotal > 0 ? bottomSkin / bottomTotal : 0;
+  const skinCentroidX = totalSkinPixels > 0 ? sumNormX / totalSkinPixels : 0;
+  const skinCentroidY = totalSkinPixels > 0 ? sumNormY / totalSkinPixels : 0;
+
+  const metrics: LiveGuidanceMetrics = {
+    ...base,
+    totalSkinRatio,
+    leftSkinRatio,
+    rightSkinRatio,
+    topSkinRatio,
+    bottomSkinRatio,
+    skinCentroidX,
+    skinCentroidY,
+    motionScore,
+    hasMotionBaseline,
+  };
+
+  const isStable = hasMotionBaseline && motionScore <= maxMotionDelta;
+  const rawSkinConfidence = Math.min(
+    1,
+    Math.max(
+      0,
+      base.centerSkinRatio * 0.65 +
+        totalSkinRatio * 0.35 +
+        (base.frameStdDev >= 4 ? 0.1 : -0.15)
+    )
+  );
+
+  // 1. Blocked lens / dead feed
+  if (qualityReport.issues.includes('capture_failed')) {
+    return {
+      checkPerformed: true,
+      category: 'uncertain',
+      condition: 'uncertain',
+      skinConfidence: 0,
+      isStable: false,
+      instruction:
+        'The camera feed is completely dark. Make sure the camera lens is uncovered and point toward a well-lit area.',
+      statusLabel: 'Lens blocked or dark',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  // 2. Lighting checks first (skin & focus depend on light)
+  if (qualityReport.issues.includes('too_dark')) {
+    return {
+      checkPerformed: true,
+      category: 'quality_insufficient',
+      condition: 'too_dark',
+      skinConfidence: rawSkinConfidence,
+      isStable,
+      instruction: 'The area is too dark. Try facing a brighter light source.',
+      statusLabel: 'Lighting too dark',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  if (qualityReport.issues.includes('too_bright')) {
+    return {
+      checkPerformed: true,
+      category: 'quality_insufficient',
+      condition: 'too_bright',
+      skinConfidence: rawSkinConfidence,
+      isStable,
+      instruction:
+        'There is too much glare. Angle your phone slightly away from direct light.',
+      statusLabel: 'Too much glare',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  // 3. No skin visible anywhere in the frame
+  if (totalSkinRatio < 0.08 && base.centerSkinRatio < 0.08) {
+    return {
+      checkPerformed: true,
+      category: 'no_skin_visible',
+      condition: 'no_skin',
+      skinConfidence: rawSkinConfidence,
+      isStable,
+      instruction:
+        "I can't see the skin area yet. Slowly move your phone to the left.",
+      statusLabel: 'Searching for skin',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  // 4. Strong camera shake overrides framing read
+  if (hasMotionBaseline && motionScore > maxMotionDelta * 1.45) {
+    return {
+      checkPerformed: true,
+      category: 'quality_insufficient',
+      condition: 'unstable',
+      skinConfidence: rawSkinConfidence,
+      isStable: false,
+      instruction: 'Hold your phone steady for a moment.',
+      statusLabel: 'Camera moving',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  // 5. Framing alignment & distance checks when skin is present
+  if (base.centerSkinRatio < minCenterSkinRatio) {
+    const absX = Math.abs(skinCentroidX);
+    const absY = Math.abs(skinCentroidY);
+
+    if (absX >= absY && absX > 0.16) {
+      if (skinCentroidX < 0) {
+        return {
+          checkPerformed: true,
+          category: 'skin_not_framed',
+          condition: 'move_left',
+          skinConfidence: rawSkinConfidence,
+          isStable,
+          instruction: 'Move your phone slowly to the left.',
+          statusLabel: 'Adjust left',
+          metrics,
+          snapshot,
+          qualityReport,
+        };
+      }
+      return {
+        checkPerformed: true,
+        category: 'skin_not_framed',
+        condition: 'move_right',
+        skinConfidence: rawSkinConfidence,
+        isStable,
+        instruction: 'Move your phone slowly to the right.',
+        statusLabel: 'Adjust right',
+        metrics,
+        snapshot,
+        qualityReport,
+      };
+    }
+
+    if (absY > 0.16) {
+      if (skinCentroidY < 0) {
+        return {
+          checkPerformed: true,
+          category: 'skin_not_framed',
+          condition: 'move_up',
+          skinConfidence: rawSkinConfidence,
+          isStable,
+          instruction: 'Move your phone slowly upwards.',
+          statusLabel: 'Adjust upwards',
+          metrics,
+          snapshot,
+          qualityReport,
+        };
+      }
+      return {
+        checkPerformed: true,
+        category: 'skin_not_framed',
+        condition: 'move_down',
+        skinConfidence: rawSkinConfidence,
+        isStable,
+        instruction: 'Move your phone slowly downwards.',
+        statusLabel: 'Adjust downwards',
+        metrics,
+        snapshot,
+        qualityReport,
+      };
+    }
+
+    return {
+      checkPerformed: true,
+      category: 'skin_not_framed',
+      condition: 'too_far',
+      skinConfidence: rawSkinConfidence,
+      isStable,
+      instruction: 'I can see your skin. Move your phone a little closer.',
+      statusLabel: 'Move closer',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  // Skin covers part of center ROI, but overall area is still small (too far away)
+  if (totalSkinRatio < minTotalSkinRatio) {
+    return {
+      checkPerformed: true,
+      category: 'skin_not_framed',
+      condition: 'too_far',
+      skinConfidence: rawSkinConfidence,
+      isStable,
+      instruction: 'I can see your skin. Move your phone a little closer.',
+      statusLabel: 'Move closer',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  // 6. Camera stability check
+  if (hasMotionBaseline && motionScore > maxMotionDelta) {
+    return {
+      checkPerformed: true,
+      category: 'quality_insufficient',
+      condition: 'unstable',
+      skinConfidence: rawSkinConfidence,
+      isStable: false,
+      instruction: 'Hold your phone steady for a moment.',
+      statusLabel: 'Hold steady',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  // 7. Target pressed too close to lens (blocks light or fills frame without focus)
+  if (
+    totalSkinRatio > 0.9 &&
+    base.centerSkinRatio > 0.92 &&
+    centerMeanLum < 72
+  ) {
+    return {
+      checkPerformed: true,
+      category: 'skin_not_framed',
+      condition: 'too_close',
+      skinConfidence: rawSkinConfidence,
+      isStable,
+      instruction: 'Move your phone slightly farther away.',
+      statusLabel: 'Move farther away',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  // 8. Focus / sharpness check
+  if (qualityReport.issues.includes('blurry')) {
+    return {
+      checkPerformed: true,
+      category: 'quality_insufficient',
+      condition: 'blurry',
+      skinConfidence: rawSkinConfidence,
+      isStable,
+      instruction:
+        'The image looks blurry. Hold your phone steady about one hand’s length from your skin.',
+      statusLabel: 'Focus unclear',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  if (
+    totalSkinRatio > 0.9 &&
+    base.centerSkinRatio > 0.92 &&
+    base.sharpnessScore < 26 &&
+    base.edgeStrength < 9.5
+  ) {
+    return {
+      checkPerformed: true,
+      category: 'skin_not_framed',
+      condition: 'too_close',
+      skinConfidence: rawSkinConfidence,
+      isStable,
+      instruction: 'Move your phone slightly farther away.',
+      statusLabel: 'Move farther away',
+      metrics,
+      snapshot,
+      qualityReport,
+    };
+  }
+
+  // 8. Properly framed, clear, well-lit
+  return {
+    checkPerformed: true,
+    category: 'skin_ready',
+    condition: 'ready',
+    skinConfidence: Math.max(rawSkinConfidence, 0.7),
+    isStable,
+    instruction: 'Excellent. I can see the skin area clearly. Keep your phone steady.',
+    statusLabel: isStable ? 'Clear and steady' : 'Checking stability',
+    metrics,
+    snapshot,
+    qualityReport,
+  };
+}
+
+/**
+ * Samples a live HTMLVideoElement frame without storing any image for real-time guidance.
+ */
+export function evaluateLiveGuidanceFromVideo(
+  video: HTMLVideoElement | null,
+  previousSnapshot: Float32Array | null = null,
+  config: LiveGuidanceConfig = {}
+): LiveGuidanceEvaluation {
+  if (
+    !video ||
+    video.readyState < 2 ||
+    video.videoWidth === 0 ||
+    video.videoHeight === 0
+  ) {
+    return buildUncertainLiveGuidance(
+      'Camera preview is initializing. Hold on a moment.'
+    );
+  }
+
+  try {
+    const analysisCanvas = document.createElement('canvas');
+    analysisCanvas.width = ANALYSIS_WIDTH;
+    analysisCanvas.height = ANALYSIS_HEIGHT;
+    const analysisCtx = analysisCanvas.getContext('2d', { willReadFrequently: true });
+    if (!analysisCtx) {
+      return buildUncertainLiveGuidance(
+        'Unable to read the camera frame buffer for live framing guidance.'
+      );
+    }
+    analysisCtx.drawImage(video, 0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
+    const imageData = analysisCtx.getImageData(0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
+    return analyzeLiveGuidanceFrame(imageData, previousSnapshot, config);
+  } catch {
+    return buildUncertainLiveGuidance(
+      'Live framing check could not be performed on this device.'
+    );
+  }
+}
+

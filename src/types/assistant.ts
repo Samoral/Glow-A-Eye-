@@ -1,8 +1,10 @@
 export type AssistantStatus =
   | 'idle'
   | 'listening'
-  | 'thinking'
+  | 'processing'
   | 'speaking'
+  | 'interrupted'
+  | 'resuming'
   | 'error';
 
 export type PermissionState =
@@ -165,12 +167,32 @@ export interface SavedAssessmentRecord {
   triggeredWarningSigns: string[];
 }
 
+export type CameraSessionState =
+  | 'inactive'
+  | 'requesting_permission'
+  | 'initializing_camera'
+  | 'searching_for_skin'
+  | 'guiding_positioning'
+  | 'target_detected'
+  | 'checking_stability'
+  | 'countdown'
+  | 'capturing'
+  | 'validating_photograph'
+  | 'analyzing'
+  | 'error'
+  | 'cancelled';
+
 export interface VoiceCommandAction {
   type:
     | 'none'
     | 'repeat'
+    | 'repeat_differently'
     | 'stop_speaking'
     | 'stop_listening'
+    | 'pause_for_user'
+    | 'resume_conversation'
+    | 'correct_last_statement'
+    | 'explain_observation_term'
     | 'open_camera'
     | 'activate_camera'
     | 'close_camera'
@@ -180,6 +202,7 @@ export interface VoiceCommandAction {
     | 'repeat_camera_guide'
     | 'simplify_camera_guide'
     | 'check_camera_framing'
+    | 'camera_help'
     | 'analyze_photo'
     | 'repeat_observations'
     | 'explain_simpler'
@@ -214,6 +237,8 @@ export interface VoiceCommandAction {
     | 'enable_light_theme'
     | 'enable_large_text';
   transcript?: string;
+  term?: string;
 }
+
 
 

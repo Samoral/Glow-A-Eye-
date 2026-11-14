@@ -1,381 +1,342 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { SkinAnalysisObservation } from '../types/assistant.ts';
-import { formatSpokenTime, playAudioCue } from '../utils/accessibility.ts';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type {
+  CameraSessionState,
+  SkinAnalysisObservation,
+} from '../types/assistant.ts';
+import { playAudioCue } from '../utils/accessibility.ts';
 import {
   captureAndEvaluateVideoFrame,
-  type CapturedPhotoResult,
-  evaluateLiveVideoFrame,
+  evaluateLiveGuidanceFromVideo,
 } from '../utils/imageQuality.ts';
 import {
+  explainSkinObservationTerm,
   formatCausesSpeech,
-  formatFullObservationSpeech,
   formatNextStepsSpeech,
   formatObservationsOnlySpeech,
   formatSimplerSpeech,
   requestSkinObservation,
 } from '../services/skinAnalysisClient.ts';
-
-const DETAILED_GUIDE =
-  'Camera is active. Hold the rear camera about 15 to 20 centimeters—roughly one hand’s length—away from the skin area. If the area feels too far, move slightly closer; if blurry, pull back a touch and keep your hand steady in bright, even light. Say "Take picture" when ready, "Simplify" for shorter instructions, or "Cancel" to exit.';
-
-const SIMPLIFIED_GUIDE =
-  'Hold camera one hand’s length from your skin in even light. Hold steady and say "Take picture".';
+import {
+  CameraGuidanceController,
+  type CameraEngineSnapshot,
+} from '../services/cameraGuidanceEngine.ts';
 
 interface UseCameraSkinAnalysisOptions {
   audioCuesEnabled: boolean;
   onSpeakFeedback: (
     text: string,
     alsoLog?: boolean,
-    options?: { listenAfter?: boolean }
+    options?: { listenAfter?: boolean; onDone?: () => void }
   ) => void;
+  isAssistantSpeaking?: () => boolean;
+  isUserSpeaking?: () => boolean;
 }
+
+const INITIAL_SNAPSHOT: CameraEngineSnapshot = {
+  state: 'inactive',
+  stateLabel: 'Camera Inactive',
+  guidanceText: '',
+  countdownSeconds: null,
+  lastEvaluation: null,
+  capturedPhoto: null,
+  observation: null,
+  errorMessage: null,
+  isPreviewVisible: false,
+  isActiveSession: false,
+};
 
 export function useCameraSkinAnalysis({
   audioCuesEnabled,
   onSpeakFeedback,
+  isAssistantSpeaking,
+  isUserSpeaking,
 }: UseCameraSkinAnalysisOptions) {
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [isRequesting, setIsRequesting] = useState(false);
-  const [simplifiedGuide, setSimplifiedGuide] = useState(false);
-  const [capturedPhoto, setCapturedPhoto] = useState<CapturedPhotoResult | null>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [observation, setObservation] = useState<SkinAnalysisObservation | null>(null);
+  const [snapshot, setSnapshot] = useState<CameraEngineSnapshot>(INITIAL_SNAPSHOT);
 
   const streamRef = useRef<MediaStream | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const isAnalyzingRef = useRef(false);
-  const slowAnalysisTimerRef = useRef<number | null>(null);
+  const streamRequestIdRef = useRef<number>(0);
+  const audioCuesRef = useRef(audioCuesEnabled);
+  const speakRef = useRef(onSpeakFeedback);
+  const isAssistantSpeakingRef = useRef(isAssistantSpeaking);
+  const isUserSpeakingRef = useRef(isUserSpeaking);
 
-  const clearSlowAnalysisTimer = useCallback(() => {
-    if (slowAnalysisTimerRef.current !== null) {
-      window.clearTimeout(slowAnalysisTimerRef.current);
-      slowAnalysisTimerRef.current = null;
-    }
-  }, []);
+  useEffect(() => {
+    audioCuesRef.current = audioCuesEnabled;
+  }, [audioCuesEnabled]);
+
+  useEffect(() => {
+    speakRef.current = onSpeakFeedback;
+  }, [onSpeakFeedback]);
+
+  useEffect(() => {
+    isAssistantSpeakingRef.current = isAssistantSpeaking;
+  }, [isAssistantSpeaking]);
+
+  useEffect(() => {
+    isUserSpeakingRef.current = isUserSpeaking;
+  }, [isUserSpeaking]);
 
   const stopStreamTracks = useCallback(() => {
+    // Invalidate any in-flight getUserMedia request so late resolutions stop immediately
+    streamRequestIdRef.current += 1;
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+
     if (videoRef.current) {
+      const attached = videoRef.current.srcObject as MediaStream | null;
+      if (attached && typeof attached.getTracks === 'function') {
+        attached.getTracks().forEach((track) => track.stop());
+      }
+      try {
+        videoRef.current.pause();
+      } catch {
+        // ignore pause errors during teardown
+      }
       videoRef.current.srcObject = null;
     }
   }, []);
 
+  const controller = useMemo(
+    () =>
+      new CameraGuidanceController({
+        requestCameraStream: async () => {
+          if (
+            typeof navigator === 'undefined' ||
+            !navigator.mediaDevices ||
+            !navigator.mediaDevices.getUserMedia
+          ) {
+            return {
+              ok: false,
+              denied: false,
+              unsupported: true,
+              message:
+                'Camera access is not supported in this browser or device environment.',
+            };
+          }
+
+          // Guard against duplicate streams and track this specific request ID
+          stopStreamTracks();
+          const reqId = ++streamRequestIdRef.current;
+
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+              video: {
+                facingMode: { ideal: 'environment' },
+                width: { ideal: 1280 },
+                height: { ideal: 960 },
+              },
+              audio: false,
+            });
+
+            // If cancelled or superseded while awaiting getUserMedia, release hardware immediately
+            if (reqId !== streamRequestIdRef.current) {
+              stream.getTracks().forEach((track) => track.stop());
+              return {
+                ok: false,
+                denied: false,
+                message: 'Camera session was cancelled before initialization completed.',
+              };
+            }
+
+            streamRef.current = stream;
+            if (videoRef.current) {
+              videoRef.current.srcObject = stream;
+              void videoRef.current.play().catch(() => {});
+            }
+            return { ok: true };
+          } catch (err) {
+            if (reqId !== streamRequestIdRef.current) {
+              return {
+                ok: false,
+                denied: false,
+                message: 'Camera session was cancelled.',
+              };
+            }
+            const name = err instanceof Error ? err.name : '';
+            const denied =
+              name === 'NotAllowedError' || name === 'PermissionDeniedError';
+            return {
+              ok: false,
+              denied,
+              message: denied
+                ? 'Camera permission was denied. Please allow camera access in your browser settings, then say "Open camera" to try again.'
+                : 'No active camera could be opened right now. Ensure a camera is connected and not in use by another app.',
+            };
+          }
+        },
+        stopCameraStream: () => {
+          stopStreamTracks();
+        },
+        sampleFrame: (previousSnapshot) =>
+          evaluateLiveGuidanceFromVideo(videoRef.current, previousSnapshot),
+        captureFrame: () => captureAndEvaluateVideoFrame(videoRef.current),
+        analyzeCapturedPhoto: (dataUrl) => requestSkinObservation(dataUrl),
+        speak: (text, options) => {
+          speakRef.current(text, options?.alsoLog, {
+            listenAfter: options?.listenAfter,
+            onDone: options?.onDone,
+          });
+        },
+        playCue: (kind) => {
+          playAudioCue(kind, audioCuesRef.current);
+        },
+        isAssistantSpeaking: () =>
+          isAssistantSpeakingRef.current ? isAssistantSpeakingRef.current() : false,
+        isUserSpeaking: () =>
+          isUserSpeakingRef.current ? isUserSpeakingRef.current() : false,
+        onStateChange: (next) => {
+          setSnapshot(next);
+        },
+      }),
+    [stopStreamTracks]
+  );
+
+  // Keep <video> bound only while preview is visible; release immediately when hidden
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (snapshot.isPreviewVisible && streamRef.current) {
+      if (video.srcObject !== streamRef.current) {
+        video.srcObject = streamRef.current;
+      }
+      void video.play().catch(() => {});
+    } else if (!snapshot.isPreviewVisible) {
+      const attached = video.srcObject as MediaStream | null;
+      if (attached && typeof attached.getTracks === 'function') {
+        attached.getTracks().forEach((track) => track.stop());
+      }
+      try {
+        video.pause();
+      } catch {
+        // ignore
+      }
+      video.srcObject = null;
+    }
+  }, [snapshot.isPreviewVisible, snapshot.state]);
+
+  // Dispose camera stream and timers on unmount
+  useEffect(() => {
+    return () => {
+      controller.dispose();
+    };
+  }, [controller]);
+
+  const startCamera = useCallback(async () => {
+    await controller.start();
+  }, [controller]);
+
+  const stopCameraSession = useCallback(
+    (announcement?: string, listenAfter = true, silent = false) => {
+      stopStreamTracks();
+      if (silent) {
+        controller.stopSilently();
+        return;
+      }
+      controller.stopCameraSession({
+        announcement:
+          announcement ?? 'Camera cancelled and temporary image discarded.',
+        listenAfter,
+        silent: false,
+        clearObservation: false,
+      });
+    },
+    [controller, stopStreamTracks]
+  );
+
   const stopCamera = useCallback(
     (announcement?: string, listenAfter = false) => {
-      const hadAnything =
-        isStreaming ||
-        streamRef.current !== null ||
-        capturedPhoto !== null ||
-        observation !== null;
-
-      clearSlowAnalysisTimer();
-      isAnalyzingRef.current = false;
-      stopStreamTracks();
-      setIsStreaming(false);
-      setIsRequesting(false);
-      setCapturedPhoto(null);
-      setIsAnalyzing(false);
-      setObservation(null);
-
-      if (hadAnything && announcement) {
-        playAudioCue('listen-stop', audioCuesEnabled);
-        onSpeakFeedback(announcement, true, { listenAfter });
-      }
-    },
-    [
-      audioCuesEnabled,
-      capturedPhoto,
-      clearSlowAnalysisTimer,
-      isStreaming,
-      observation,
-      onSpeakFeedback,
-      stopStreamTracks,
-    ]
-  );
-
-  // Attach MediaStream whenever video element and stream are ready
-  useEffect(() => {
-    if (isStreaming && videoRef.current && streamRef.current) {
-      videoRef.current.srcObject = streamRef.current;
-      void videoRef.current.play().catch(() => {});
-    }
-  }, [isStreaming]);
-
-  const startCamera = useCallback(
-    async (customPostStartSpeech?: string) => {
-      if (
-        typeof navigator === 'undefined' ||
-        !navigator.mediaDevices ||
-        !navigator.mediaDevices.getUserMedia
-      ) {
-        const msg =
-          'Camera access is not supported in this browser or device environment.';
-        playAudioCue('error', audioCuesEnabled);
-        onSpeakFeedback(msg, true, { listenAfter: true });
+      if (!announcement) {
+        stopCameraSession(undefined, false, true);
         return;
       }
-
-      if (isStreaming && streamRef.current) {
-        setCapturedPhoto(null);
-        setObservation(null);
-        const guideText =
-          customPostStartSpeech ?? (simplifiedGuide ? SIMPLIFIED_GUIDE : DETAILED_GUIDE);
-        onSpeakFeedback(guideText, false, { listenAfter: true });
-        return;
-      }
-
-      setIsRequesting(true);
-      setCapturedPhoto(null);
-      setObservation(null);
-
-      onSpeakFeedback(
-        'Requesting camera access, preferring the rear-facing camera. Please allow camera permission if prompted.',
-        false
-      );
-
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 960 },
-          },
-          audio: false,
-        });
-
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          void videoRef.current.play().catch(() => {});
-        }
-        setIsStreaming(true);
-        setIsRequesting(false);
-
-        playAudioCue('camera-ready', audioCuesEnabled);
-        const guideText =
-          customPostStartSpeech ?? (simplifiedGuide ? SIMPLIFIED_GUIDE : DETAILED_GUIDE);
-        onSpeakFeedback(guideText, true, { listenAfter: true });
-      } catch (err) {
-        setIsRequesting(false);
-        setIsStreaming(false);
-        const name = err instanceof Error ? err.name : '';
-        const isDenied =
-          name === 'NotAllowedError' || name === 'PermissionDeniedError';
-
-        const msg = isDenied
-          ? 'Camera permission was denied. Please allow camera access in your browser settings if you wish to use guided camera capture.'
-          : 'No active camera could be opened right now. Ensure a camera is connected and not in use by another app.';
-        playAudioCue('error', audioCuesEnabled);
-        onSpeakFeedback(msg, true, { listenAfter: true });
-      }
+      stopCameraSession(announcement, listenAfter, false);
     },
-    [audioCuesEnabled, isStreaming, onSpeakFeedback, simplifiedGuide]
+    [stopCameraSession]
   );
-
-  const handleRetake = useCallback(() => {
-    clearSlowAnalysisTimer();
-    isAnalyzingRef.current = false;
-    setCapturedPhoto(null);
-    setObservation(null);
-    setIsAnalyzing(false);
-
-    if (isStreaming && streamRef.current) {
-      playAudioCue('listen-start', audioCuesEnabled);
-      onSpeakFeedback(
-        'Ready to retake. Hold your camera steady 15 to 20 centimeters from the skin area in even light, then say "Take picture".',
-        true,
-        { listenAfter: true }
-      );
-    } else {
-      void startCamera(
-        'Camera reopened for retake. Hold steady one hand’s length from the skin area and say "Take picture".'
-      );
-    }
-  }, [audioCuesEnabled, clearSlowAnalysisTimer, isStreaming, onSpeakFeedback, startCamera]);
 
   const handleCapture = useCallback(() => {
-    if (capturedPhoto) {
-      handleRetake();
-      return;
-    }
+    void controller.triggerManualCapture();
+  }, [controller]);
 
-    if (!isStreaming || !streamRef.current) {
-      void startCamera(
-        'Camera is now active. Hold one hand’s length from the skin area in even light, then say "Take picture".'
-      );
-      return;
-    }
-
-    const { dataUrl, report } = captureAndEvaluateVideoFrame(videoRef.current);
-
-    if (!dataUrl || !report.checkPerformed) {
-      playAudioCue('error', audioCuesEnabled);
-      onSpeakFeedback(report.spokenFeedback, true, { listenAfter: true });
-      return;
-    }
-
-    setCapturedPhoto({
-      dataUrl,
-      report,
-      capturedAt: formatSpokenTime(),
-    });
-    setObservation(null);
-
-    if (report.passed) {
-      playAudioCue('camera-ready', audioCuesEnabled);
-      onSpeakFeedback(
-        'Image quality check passed. Lighting, focus, and skin framing look clear. Your photo stays in temporary memory only. Say "Analyze photo" to hear cautious observations, or say "Retake" or "Cancel".',
-        true,
-        { listenAfter: true }
-      );
-    } else {
-      playAudioCue('error', audioCuesEnabled);
-      onSpeakFeedback(
-        `${report.spokenFeedback} You can say "Retake", or say "Analyze photo" if you still want Glow-A-Eye to inspect this image.`,
-        true,
-        { listenAfter: true }
-      );
-    }
-  }, [
-    audioCuesEnabled,
-    capturedPhoto,
-    handleRetake,
-    isStreaming,
-    onSpeakFeedback,
-    startCamera,
-  ]);
+  const handleRetake = useCallback(() => {
+    void controller.retake();
+  }, [controller]);
 
   const handleCancel = useCallback(() => {
-    if (!isStreaming && !capturedPhoto && !observation) {
-      onSpeakFeedback('Camera is already closed and no photo is stored.', false, {
-        listenAfter: true,
-      });
-      return;
-    }
-    stopCamera('Camera capture cancelled and temporary image discarded.', true);
-  }, [capturedPhoto, isStreaming, observation, onSpeakFeedback, stopCamera]);
+    stopCameraSession('Camera cancelled and temporary image discarded.', true, false);
+  }, [stopCameraSession]);
 
   const handleCheckLiveFraming = useCallback(() => {
-    if (!isStreaming || capturedPhoto) {
-      onSpeakFeedback(
-        'Say "Open camera" first so I can check lighting and framing.',
-        false,
-        { listenAfter: true }
-      );
-      return;
-    }
-
-    const report = evaluateLiveVideoFrame(videoRef.current);
-    if (!report.checkPerformed) {
-      playAudioCue('error', audioCuesEnabled);
-      onSpeakFeedback(report.spokenFeedback, false, { listenAfter: true });
-      return;
-    }
-
-    if (report.passed) {
-      playAudioCue('camera-ready', audioCuesEnabled);
-      onSpeakFeedback(
-        'Live check looks good. Lighting, focus, and skin framing look clear. Hold steady and say "Take picture".',
-        false,
-        { listenAfter: true }
-      );
-    } else {
-      playAudioCue('error', audioCuesEnabled);
-      onSpeakFeedback(
-        report.spokenFeedback.replace('say Retake', 'adjust before taking your picture'),
-        false,
-        { listenAfter: true }
-      );
-    }
-  }, [audioCuesEnabled, capturedPhoto, isStreaming, onSpeakFeedback]);
+    controller.checkFramingNow();
+  }, [controller]);
 
   const handleAnalyzePhoto = useCallback(async () => {
-    if (isAnalyzingRef.current || isAnalyzing) {
-      onSpeakFeedback('Analysis is already in progress. Please wait a moment.', false);
-      return;
-    }
+    await controller.retryAnalysis();
+  }, [controller]);
 
-    if (!capturedPhoto) {
-      onSpeakFeedback(
-        'No captured photograph is ready yet. Say "Open camera" and "Take picture" first.',
-        true,
-        { listenAfter: true }
-      );
-      return;
-    }
+  const repeatLastGuidance = useCallback(() => {
+    controller.repeatLastGuidance();
+  }, [controller]);
 
-    isAnalyzingRef.current = true;
-    setIsAnalyzing(true);
-    setObservation(null);
-    playAudioCue('listen-start', audioCuesEnabled);
-    onSpeakFeedback('Analyzing your photograph now. Please wait a moment.', false);
-
-    clearSlowAnalysisTimer();
-    slowAnalysisTimerRef.current = window.setTimeout(() => {
-      if (isAnalyzingRef.current) {
+  const speakGuide = useCallback(
+    (useSimple: boolean) => {
+      if (useSimple) {
         onSpeakFeedback(
-          'Still examining your photograph carefully. Please hold on a moment.',
-          false
-        );
-      }
-    }, 9000);
-
-    try {
-      const result = await requestSkinObservation(capturedPhoto.dataUrl);
-
-      if (!result.ok) {
-        playAudioCue('error', audioCuesEnabled);
-        onSpeakFeedback(
-          `${result.error} You can say "Analyze photo" to try again, "Retake", or "Cancel".`,
-          true,
+          'Hold the rear camera one hand’s length from your skin in even light. I will guide you and take the photo automatically when steady.',
+          false,
           { listenAfter: true }
         );
         return;
       }
+      controller.repeatLastGuidance();
+    },
+    [controller, onSpeakFeedback]
+  );
 
-      setObservation(result.observation);
-      playAudioCue('camera-ready', audioCuesEnabled);
+  const speakCameraHelp = useCallback(() => {
+    controller.speakCameraHelp();
+  }, [controller]);
+
+  const pauseGuidance = useCallback(() => {
+    controller.pauseGuidanceForUser();
+  }, [controller]);
+
+  const resumeGuidance = useCallback(() => {
+    controller.resumeGuidanceLoop();
+  }, [controller]);
+
+  const speakTermExplanation = useCallback(
+    (term: string) => {
       onSpeakFeedback(
-        `${formatFullObservationSpeech(result.observation)} Would you like to answer a few tailored follow-up symptom questions so I can run a safety check and give more helpful guidance? Say "Yes" or "Start questions".`,
+        explainSkinObservationTerm(term, snapshot.observation, null),
         true,
         { listenAfter: true }
       );
-    } finally {
-      clearSlowAnalysisTimer();
-      isAnalyzingRef.current = false;
-      setIsAnalyzing(false);
-    }
-  }, [audioCuesEnabled, capturedPhoto, clearSlowAnalysisTimer, isAnalyzing, onSpeakFeedback]);
-
-  const speakGuide = useCallback(
-    (useSimple: boolean) => {
-      if (useSimple) setSimplifiedGuide(true);
-      onSpeakFeedback(useSimple ? SIMPLIFIED_GUIDE : DETAILED_GUIDE, false, {
-        listenAfter: true,
-      });
     },
-    [onSpeakFeedback]
+    [onSpeakFeedback, snapshot.observation]
   );
 
   const speakObservationRepeat = useCallback(() => {
-    if (!observation) {
+    if (!snapshot.observation) {
       onSpeakFeedback(
-        'No skin observations are available yet. Say "Open camera" and "Take picture" first.',
+        'No skin observations are available yet. Say "Open camera" to examine your skin first.',
         false,
         { listenAfter: true }
       );
       return;
     }
-    onSpeakFeedback(formatObservationsOnlySpeech(observation), false, {
+    onSpeakFeedback(formatObservationsOnlySpeech(snapshot.observation), false, {
       listenAfter: true,
     });
-  }, [observation, onSpeakFeedback]);
+  }, [onSpeakFeedback, snapshot.observation]);
 
   const speakObservationSimpler = useCallback(() => {
-    if (!observation) {
+    if (!snapshot.observation) {
       onSpeakFeedback(
         'No skin observations are available to simplify yet.',
         false,
@@ -383,11 +344,13 @@ export function useCameraSkinAnalysis({
       );
       return;
     }
-    onSpeakFeedback(formatSimplerSpeech(observation), true, { listenAfter: true });
-  }, [observation, onSpeakFeedback]);
+    onSpeakFeedback(formatSimplerSpeech(snapshot.observation), true, {
+      listenAfter: true,
+    });
+  }, [onSpeakFeedback, snapshot.observation]);
 
   const speakObservationCauses = useCallback(() => {
-    if (!observation) {
+    if (!snapshot.observation) {
       onSpeakFeedback(
         'Please capture and analyze a photograph first so I can share cautious possibilities.',
         false,
@@ -395,11 +358,13 @@ export function useCameraSkinAnalysis({
       );
       return;
     }
-    onSpeakFeedback(formatCausesSpeech(observation), true, { listenAfter: true });
-  }, [observation, onSpeakFeedback]);
+    onSpeakFeedback(formatCausesSpeech(snapshot.observation), true, {
+      listenAfter: true,
+    });
+  }, [onSpeakFeedback, snapshot.observation]);
 
   const speakObservationNextSteps = useCallback(() => {
-    if (!observation) {
+    if (!snapshot.observation) {
       onSpeakFeedback(
         'Please capture and analyze a photograph first, or consult a doctor or dermatologist directly for any concerning skin symptom.',
         false,
@@ -407,35 +372,48 @@ export function useCameraSkinAnalysis({
       );
       return;
     }
-    onSpeakFeedback(formatNextStepsSpeech(observation), true, { listenAfter: true });
-  }, [observation, onSpeakFeedback]);
+    onSpeakFeedback(formatNextStepsSpeech(snapshot.observation), true, {
+      listenAfter: true,
+    });
+  }, [onSpeakFeedback, snapshot.observation]);
 
-  useEffect(() => {
-    return () => {
-      clearSlowAnalysisTimer();
-      isAnalyzingRef.current = false;
-      stopStreamTracks();
-    };
-  }, [clearSlowAnalysisTimer, stopStreamTracks]);
+  const cameraState: CameraSessionState = snapshot.state;
+  const isStreaming = snapshot.isPreviewVisible;
+  const isRequesting = snapshot.state === 'requesting_permission';
+  const isAnalyzing = snapshot.state === 'analyzing';
+  const observation: SkinAnalysisObservation | null = snapshot.observation;
 
   return {
     videoRef,
+    cameraState,
+    cameraStateLabel: snapshot.stateLabel,
+    guidanceText: snapshot.guidanceText,
+    countdownSeconds: snapshot.countdownSeconds,
+    lastEvaluation: snapshot.lastEvaluation,
+    errorMessage: snapshot.errorMessage,
+    isPreviewVisible: snapshot.isPreviewVisible,
+    isActiveSession: snapshot.isActiveSession,
     isStreaming,
     isRequesting,
     isAnalyzing,
-    capturedPhoto,
-    hasCapturedPhoto: capturedPhoto !== null,
+    capturedPhoto: snapshot.capturedPhoto,
+    hasCapturedPhoto: snapshot.capturedPhoto !== null,
     observation,
     hasAnalysis: observation !== null,
-    simplifiedGuide,
     startCamera,
+    stopCameraSession,
     stopCamera,
     handleCapture,
     handleRetake,
     handleCancel,
     handleCheckLiveFraming,
     handleAnalyzePhoto,
+    repeatLastGuidance,
     speakGuide,
+    speakCameraHelp,
+    pauseGuidance,
+    resumeGuidance,
+    speakTermExplanation,
     speakObservationRepeat,
     speakObservationSimpler,
     speakObservationCauses,

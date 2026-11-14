@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { analyzeSkinPhotograph, runGeminiTextProbe } from './server/analyzeSkin.ts';
 import { assessSkinSymptoms } from './server/assessSkinSymptoms.ts';
+import { transcribeInterruptionAudio } from './server/transcribeInterruption.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -109,6 +110,31 @@ export function createApp() {
       res.status(500).json({
         code: 'INTERNAL_ERROR',
         error: 'An unexpected error occurred while running the symptom safety check.',
+      });
+    }
+  });
+
+  app.post('/api/transcribe-interruption', async (req, res) => {
+    try {
+      const result = await transcribeInterruptionAudio(req.body);
+      if (!result.ok) {
+        res.status(result.status).json({
+          code: result.code,
+          error: result.error,
+        });
+        return;
+      }
+      res.json({
+        transcript: result.transcript,
+        meta: {
+          model: result.model,
+          durationMs: result.durationMs,
+        },
+      });
+    } catch {
+      res.status(500).json({
+        code: 'INTERNAL_ERROR',
+        error: 'An unexpected error occurred while transcribing audio.',
       });
     }
   });

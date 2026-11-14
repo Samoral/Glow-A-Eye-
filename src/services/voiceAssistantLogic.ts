@@ -22,6 +22,36 @@ export const WELCOME_GREETING =
 export const ABOUT_SPOKEN_SUMMARY =
   'Glow-A-Eye is a voice-first skin health companion built for blind and visually impaired users. It combines guided camera positioning, pixel-level photo quality checks, cautious visual observations, adaptive symptom questions, and a dedicated Medical Safety Engine. Glow-A-Eye provides informational observations only, never a medical diagnosis, cancer screening, or prescription. Your photographs stay in temporary browser memory until you explicitly ask to analyze them, are sent securely without exposing keys, and are never saved unless you choose to save a text-only summary on your device.';
 
+export interface StrippedLeadInResult {
+  hadPrefix: boolean;
+  remainder: string;
+}
+
+/**
+ * Strips leading conversational barge-in prefixes (e.g. "Stop. ", "Wait, ",
+ * "Hold on, ") ONLY when followed by a substantive question or command,
+ * preserving standalone stop/wait/camera/listening commands intact.
+ */
+export function stripInterruptionLeadIn(rawInput: string): StrippedLeadInResult {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return { hadPrefix: false, remainder: '' };
+
+  const prefixRegex =
+    /^(?:(?:please\s+)?(?:stop speaking|stop talking|stop reading|wait a minute|wait a second|hold on|hang on|excuse me|pardon me|one moment|one second|listen)\b[\s,.:;!?-]+|(?:stop|wait)(?:[,.;:!?]+\s+|\s+(?=(?:what|why|how|where|when|who|explain|repeat|rephrase|i\b|can|could|would|tell|start|open|close|help|that|this|actually|sorry)\b))[\s,.:;!?-]*)+/i;
+
+  const match = prefixRegex.exec(trimmed);
+  if (!match) {
+    return { hadPrefix: false, remainder: trimmed };
+  }
+
+  const remainder = trimmed.slice(match[0].length).trim();
+  if (!remainder) {
+    return { hadPrefix: false, remainder: trimmed };
+  }
+
+  return { hadPrefix: true, remainder };
+}
+
 /**
  * Interprets spoken or typed user input.
  * Strictly avoids diagnosing skin diseases, prescribing medications,
@@ -31,9 +61,10 @@ export function interpretVoiceInput(
   rawInput: string,
   context: VoiceCommandContext = {}
 ): AssistantTurnResult {
-  const normalized = rawInput.trim().toLowerCase();
+  const originalTrimmed = rawInput.trim();
+  const normalizedOriginal = originalTrimmed.toLowerCase();
 
-  if (!normalized) {
+  if (!normalizedOriginal) {
     return {
       reply:
         'I did not catch any words. Tap anywhere or press Space to speak again.',
@@ -41,7 +72,11 @@ export function interpretVoiceInput(
     };
   }
 
-  // 1. Stop speaking / Stop listening / Pause microphone (always active, even mid-assessment)
+  const { remainder } = stripInterruptionLeadIn(originalTrimmed);
+  const effectiveRaw = remainder || originalTrimmed;
+  const normalized = effectiveRaw.toLowerCase();
+
+  // 1. Real-time barge-in & turn control (always active across every mode)
   if (
     /\b(stop speaking|stop talking|be quiet|quiet|silence|mute speech|stop reading)\b/.test(
       normalized
@@ -50,6 +85,56 @@ export function interpretVoiceInput(
     return {
       reply: '',
       action: { type: 'stop_speaking' },
+      handledByAction: true,
+    };
+  }
+
+  if (
+    /^(?:wait|wait a minute|wait a second|hold on|hang on|one moment|one second|excuse me|pause|just a moment|just a second|let me ask something|let me ask a question|i have a question|can i ask something|can i ask a question)[.!?]*$/.test(
+      normalized
+    )
+  ) {
+    return {
+      reply: '',
+      action: { type: 'pause_for_user', transcript: effectiveRaw },
+      handledByAction: true,
+    };
+  }
+
+  if (
+    /^(?:continue|go ahead|keep going|resume|keep speaking|where were we|carry on|please continue)[.!?]*$/.test(
+      normalized
+    )
+  ) {
+    return {
+      reply: '',
+      action: { type: 'resume_conversation' },
+      handledByAction: true,
+    };
+  }
+
+  if (
+    /\b(that's not what i meant|that is not what i meant|not what i meant|you misunderstood|that's wrong|that is wrong|no that's not right|i didn't say that)\b/.test(
+      normalized
+    ) ||
+    /^(?:actually|correction|wait no|no wait|sorry i meant|no i meant|i meant|change my last answer|change that|fix that|let me correct)\b/.test(
+      normalized
+    )
+  ) {
+    return {
+      reply: '',
+      action: { type: 'correct_last_statement', transcript: effectiveRaw },
+      handledByAction: true,
+    };
+  }
+
+  if (
+    normalized === 'stop' &&
+    (context.isCameraActive || context.hasCapturedPhoto)
+  ) {
+    return {
+      reply: '',
+      action: { type: 'cancel_camera' },
       handledByAction: true,
     };
   }
@@ -105,7 +190,7 @@ export function interpretVoiceInput(
     }
 
     if (
-      /\b(explain what you mean|what do you mean|explain the question|clarify|i don't understand)\b/.test(
+      /\b(explain what you mean|what do you mean|explain the question|explain that again|repeat differently|repeat it differently|say that differently|rephrase|clarify|i don't understand)\b/.test(
         normalized
       )
     ) {
@@ -152,11 +237,21 @@ export function interpretVoiceInput(
       };
     }
 
-    // Allow explicit utility commands even during questioning
-    if (!/\b(open settings|close camera|cancel capture|speak slower|speak faster|dark mode|light mode)\b/.test(normalized)) {
+    const isMetaQuestionDuringAssessment =
+      /^what does .+ mean\??$/.test(normalized) ||
+      /^why\??$/.test(normalized) ||
+      /\b(help me|need help)\b/.test(normalized);
+
+    // Allow explicit utility commands, camera exit & meta-questions even during questioning
+    if (
+      !isMetaQuestionDuringAssessment &&
+      !/\b(open settings|cancel camera|close camera|stop camera|exit camera|turn off camera|cancel capture|speak slower|speak faster|dark mode|light mode)\b/.test(
+        normalized
+      )
+    ) {
       return {
         reply: '',
-        action: { type: 'symptom_answer', transcript: rawInput.trim() },
+        action: { type: 'symptom_answer', transcript: effectiveRaw },
         handledByAction: true,
       };
     }
@@ -187,8 +282,13 @@ export function interpretVoiceInput(
     };
   }
 
-  // 4. Final assessment report follow-up questions
-  if (/\b(why do you think that|why do you say that|why that|how did you decide)\b/.test(normalized)) {
+  // 4. Final assessment report & explanation follow-up questions
+  if (
+    /\b(why do you think that|why do you say that|why that|why do you recommend|why should i see|how did you decide)\b/.test(
+      normalized
+    ) ||
+    /^(?:why|why is that|why though|and why)[.?!]*$/.test(normalized)
+  ) {
     return {
       reply: '',
       action: { type: 'assessment_why' },
@@ -208,6 +308,18 @@ export function interpretVoiceInput(
     return {
       reply: '',
       action: { type: 'assessment_repeat' },
+      handledByAction: true,
+    };
+  }
+
+  if (
+    /\b(explain that again|explain again|repeat differently|repeat it differently|say that differently|say it differently|say it in a different way|explain another way|rephrase that|rephrase|what did you mean by that)\b/.test(
+      normalized
+    )
+  ) {
+    return {
+      reply: '',
+      action: { type: 'repeat_differently' },
       handledByAction: true,
     };
   }
@@ -340,6 +452,26 @@ export function interpretVoiceInput(
     };
   }
 
+  const termQuestionMatch =
+    /^(?:what does|what is|what's|explain|tell me what)\s+(?:the\s+(?:word|term)\s+)?([a-z\s-]{2,45}?)\s+(?:mean|means)[.?!]*$/i.exec(
+      normalized
+    ) ||
+    /^(?:explain|what is)\s+(?:the\s+(?:word|term)\s+)?(redness|erythema|bumps?|raised bumps|scaling|flaking|swelling|blisters?|blistering|oozing|crusting|pigmentation|irregular borders?|asymmetry|inflammation|prompt review)[.?!]*$/i.exec(
+      normalized
+    );
+
+  if (termQuestionMatch?.[1]) {
+    return {
+      reply: '',
+      action: {
+        type: 'explain_observation_term',
+        term: termQuestionMatch[1].trim(),
+        transcript: effectiveRaw,
+      },
+      handledByAction: true,
+    };
+  }
+
   if (
     /\b(i want to answer some questions|answer some questions|answer questions|ask me questions|symptom questions|start questions|start symptom assessment|symptom assessment|symptom check|follow-up questions|follow up questions)\b/.test(
       normalized
@@ -444,7 +576,11 @@ export function interpretVoiceInput(
     };
   }
 
-  if (/\b(cancel capture|discard photo|discard image|discard picture)\b/.test(normalized)) {
+  if (
+    /\b(cancel camera|cancel capture|close camera|stop camera|exit camera|turn off camera|discard photo|discard image|discard picture)\b/.test(
+      normalized
+    )
+  ) {
     return {
       reply: '',
       action: { type: 'cancel_camera' },
@@ -466,10 +602,13 @@ export function interpretVoiceInput(
     };
   }
 
-  if (/\b(close camera|stop camera|exit camera|turn off camera)\b/.test(normalized)) {
+  if (
+    /\b(go back|exit)\b/.test(normalized) &&
+    (context.isCameraActive || context.hasCapturedPhoto)
+  ) {
     return {
       reply: '',
-      action: { type: 'close_camera' },
+      action: { type: 'cancel_camera' },
       handledByAction: true,
     };
   }
@@ -548,6 +687,13 @@ export function interpretVoiceInput(
   }
 
   if (/\b(home|assistant|main screen|go back)\b/.test(normalized)) {
+    if (context.isCameraActive || context.hasCapturedPhoto) {
+      return {
+        reply: '',
+        action: { type: 'cancel_camera' },
+        handledByAction: true,
+      };
+    }
     return {
       reply: 'You are on the main Glow-A-Eye voice assistant. Say "open camera" or "skin examination" to begin, or say "help".',
       action: { type: 'focus_assistant' },
@@ -555,7 +701,14 @@ export function interpretVoiceInput(
   }
 
   // 7. Help & Capabilities
-  if (/\b(help|commands|what can you do|how does this work|guide)\b/.test(normalized)) {
+  if (/\b(help me|help|commands|what can you do|how does this work|guide)\b/.test(normalized)) {
+    if (context.isCameraActive) {
+      return {
+        reply: '',
+        action: { type: 'camera_help' },
+        handledByAction: true,
+      };
+    }
     return {
       reply:
         'You can say: "Skin examination" or "Open camera", "Take picture", "Analyze photo", "Start questions" for symptom assessment, "Save this assessment", "Read saved assessments", "Delete saved assessments", "Speak slower", "Dark mode", "Stop speaking", "Stop listening", "Start again", or "End conversation". During questions, say "I don\'t know", "Skip this question", "Repeat the question", "Explain what you mean", "Go back", or "Finish assessment".',

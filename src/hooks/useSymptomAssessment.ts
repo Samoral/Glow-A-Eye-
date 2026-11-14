@@ -21,6 +21,7 @@ import {
   formatFullAssessmentSpeech,
   requestSymptomAssessment,
 } from '../services/symptomAssessmentClient.ts';
+import { explainSkinObservationTerm } from '../services/skinAnalysisClient.ts';
 import {
   clearAssessmentHistory,
   formatHistorySummarySpeech,
@@ -56,11 +57,13 @@ export function useSymptomAssessment({
   );
 
   const lastObservationTimeRef = useRef<string | null>(null);
+  const assessmentTokenRef = useRef<number>(0);
 
   useEffect(() => {
     const obsKey = observation ? observation.analyzedAt : null;
     if (obsKey !== lastObservationTimeRef.current) {
       lastObservationTimeRef.current = obsKey;
+      assessmentTokenRef.current += 1;
       setIsQuestioning(false);
       setCurrentQuestion(null);
       setAnswers([]);
@@ -71,6 +74,7 @@ export function useSymptomAssessment({
   }, [observation]);
 
   const resetAssessment = useCallback(() => {
+    assessmentTokenRef.current += 1;
     setIsQuestioning(false);
     setCurrentQuestion(null);
     setAnswers([]);
@@ -81,6 +85,9 @@ export function useSymptomAssessment({
 
   const finalizeAssessment = useCallback(
     async (collectedAnswers: SymptomAnswerRecord[], leadConfirmation?: string) => {
+      assessmentTokenRef.current += 1;
+      const token = assessmentTokenRef.current;
+
       setIsQuestioning(false);
       setCurrentQuestion(null);
       setIsGeneratingReport(true);
@@ -95,6 +102,11 @@ export function useSymptomAssessment({
         observation,
         answers: collectedAnswers,
       });
+
+      if (token !== assessmentTokenRef.current) {
+        // Stale async response discarded cleanly after reset or new correction
+        return;
+      }
 
       setIsGeneratingReport(false);
       setReport(generated);
@@ -208,6 +220,89 @@ export function useSymptomAssessment({
       observation,
       onSpeakFeedback,
     ]
+  );
+
+  const handleCorrectionByVoice = useCallback(
+    (rawTranscript?: string) => {
+      const trimmed = (rawTranscript ?? '').trim();
+      const strippedCorrection = trimmed
+        .replace(
+          /^(?:that's not what i meant|that is not what i meant|not what i meant|you misunderstood|that's wrong|that is wrong|no that's not right|i didn't say that|actually|correction|wait no|no wait|sorry i meant|no i meant|i meant|change my last answer|change that|fix that|let me correct)\b[\s,.:;!?-]*/i,
+          ''
+        )
+        .trim();
+
+      if (!strippedCorrection) {
+        onSpeakFeedback(
+          'Sorry about that. Tell me what you meant, and I will update your answer.',
+          true,
+          { listenAfter: true }
+        );
+        return;
+      }
+
+      if (answers.length > 0 && (isQuestioning || report !== null)) {
+        const prev = answers[answers.length - 1];
+        const prevDef = SYMPTOM_QUESTIONS[prev.questionId];
+        const correctedRecord = buildAnswerRecord(prevDef, 'answered', strippedCorrection);
+        const updatedAnswers = [...answers.slice(0, -1), correctedRecord];
+        setAnswers(updatedAnswers);
+
+        const confirm = buildAnswerConfirmation(correctedRecord);
+
+        if (isQuestioning) {
+          const nextAfterCorrection = selectNextSymptomQuestion(observation, updatedAnswers);
+          if (!nextAfterCorrection) {
+            void finalizeAssessment(updatedAnswers, `Updated your previous answer. ${confirm}`);
+            return;
+          }
+          setCurrentQuestion(nextAfterCorrection);
+          playAudioCue('listen-start', audioCuesEnabled);
+          onSpeakFeedback(
+            `Updated your previous answer. ${confirm} Continuing with Question ${updatedAnswers.length + 1}: ${nextAfterCorrection.spokenQuestion}`,
+            true,
+            { listenAfter: true }
+          );
+          return;
+        }
+
+        // Report already generated — recalculate report safely with corrected answer
+        void finalizeAssessment(updatedAnswers, `Updated your answer. ${confirm}`);
+        return;
+      }
+
+      if (isQuestioning && currentQuestion) {
+        const record = buildAnswerRecord(currentQuestion, 'answered', strippedCorrection);
+        advanceWithRecord(record, [...answers, record]);
+        return;
+      }
+
+      onSpeakFeedback(
+        `Got it — I noted your clarification: "${strippedCorrection}". How would you like to continue?`,
+        true,
+        { listenAfter: true }
+      );
+    },
+    [
+      advanceWithRecord,
+      answers,
+      audioCuesEnabled,
+      currentQuestion,
+      finalizeAssessment,
+      isQuestioning,
+      observation,
+      onSpeakFeedback,
+      report,
+    ]
+  );
+
+  const speakTermWithContext = useCallback(
+    (term: string) => {
+      onSpeakFeedback(explainSkinObservationTerm(term, observation, report), true, {
+        listenAfter: true,
+      });
+    },
+    [observation, onSpeakFeedback, report]
   );
 
   const handleDontKnow = useCallback(() => {
@@ -406,12 +501,15 @@ export function useSymptomAssessment({
 
   return {
     isQuestioning,
+    currentQuestion,
     isGeneratingReport,
     hasAssessmentReport: report !== null,
     report,
     startQuestioning,
     resetAssessment,
     handleSpokenAnswer,
+    handleCorrectionByVoice,
+    speakTermWithContext,
     handleDontKnow,
     handleSkipQuestion,
     handleRepeatQuestion,

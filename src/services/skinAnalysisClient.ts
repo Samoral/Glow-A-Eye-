@@ -1,5 +1,8 @@
-import { SkinAnalysisObservation } from '../types/assistant';
-import { formatSpokenTime } from '../utils/accessibility';
+import type {
+  SkinAnalysisObservation,
+  SkinAssessmentReport,
+} from '../types/assistant.ts';
+import { formatSpokenTime } from '../utils/accessibility.ts';
 
 const ALLOWED_MIME_TYPES = new Set([
   'image/jpeg',
@@ -177,3 +180,92 @@ export function formatCausesSpeech(obs: SkinAnalysisObservation): string {
 export function formatNextStepsSpeech(obs: SkinAnalysisObservation): string {
   return `Recommended next steps: ${obs.recommendedNextSteps}`;
 }
+
+const PLAIN_TERM_GLOSSARY: Array<{
+  pattern: RegExp;
+  label: string;
+  explanation: string;
+}> = [
+  {
+    pattern: /\b(redness|erythema|red patch|pinkish|flushed)\b/i,
+    label: 'redness',
+    explanation:
+      'Redness means the skin looks pinker or redder than the skin around it. That often happens when blood vessels near the surface widen from mild irritation, friction, allergy, or inflammation, though a clinician is needed to know the exact cause.',
+  },
+  {
+    pattern: /\b(bump|bumps|raised|papule|papules)\b/i,
+    label: 'raised bumps',
+    explanation:
+      'Raised bumps means small uneven spots sitting slightly above the flat surface of your skin. They can happen with irritation, clogged pores, bites, or minor rashes, and do not confirm a specific condition on their own.',
+  },
+  {
+    pattern: /\b(scaling|scaly|flaking|flaky|peeling|dryness|dry patch)\b/i,
+    label: 'scaling or flaking',
+    explanation:
+      'Scaling or flaking means the top layer of skin looks dry, rough, or shedding tiny flakes, which can come from dryness, irritation, or eczema-like changes.',
+  },
+  {
+    pattern: /\b(swelling|swollen|puffy|inflammation|inflamed)\b/i,
+    label: 'swelling or inflammation',
+    explanation:
+      'Swelling or inflammation means the area appears puffy, full, or irritated. If swelling spreads quickly or comes with breathing trouble or severe pain, seek urgent medical care.',
+  },
+  {
+    pattern: /\b(blister|blisters|blistering|fluid)\b/i,
+    label: 'blistering',
+    explanation:
+      'Blistering means small fluid-filled pockets on the skin surface. Because blisters can have sensitive skin underneath, avoid popping them and have a clinician check widespread or painful blisters.',
+  },
+  {
+    pattern: /\b(crusting|oozing|pus|discharge)\b/i,
+    label: 'oozing or crusting',
+    explanation:
+      'Oozing or crusting means liquid has leaked from the skin and dried on top. A healthcare professional should examine it to check for possible infection.',
+  },
+  {
+    pattern: /\b(irregular border|uneven border|asymmetry|asymmetric|pigment|pigmentation|mole|lesion)\b/i,
+    label: 'irregular borders or pigment changes',
+    explanation:
+      'Irregular borders or colour variation mean the edges of a dark spot look uneven rather than smooth and round, or show more than one shade. Only an in-person dermatologist check can properly evaluate a mole or pigmented spot.',
+  },
+  {
+    pattern: /\b(prompt review|urgent|emergency|medical assessment)\b/i,
+    label: 'medical assessment urgency',
+    explanation:
+      'That urgency level describes how soon it is safest to have a doctor or clinician look at the skin, based on both what is visible and any warning signs or missing details.',
+  },
+];
+
+export function explainSkinObservationTerm(
+  rawTerm: string,
+  observation: SkinAnalysisObservation | null,
+  report: SkinAssessmentReport | null = null
+): string {
+  const cleanedTerm = rawTerm
+    .replace(/^(what does|what is|explain|meaning of|the word|the term)\s+/i, '')
+    .replace(/\s+(mean|means)\??$/i, '')
+    .replace(/[?!.]+$/g, '')
+    .trim();
+
+  const match = PLAIN_TERM_GLOSSARY.find((entry) => entry.pattern.test(cleanedTerm));
+
+  if (match) {
+    const contextNote = observation
+      ? ` In your photograph (${observation.apparentLocation}), I noted: ${observation.whatICanObserve}`
+      : report
+        ? ` In your assessment: ${report.whatPhotographShows}`
+        : '';
+    return `${match.explanation}${contextNote} Remember, describing what the skin looks like is not a medical diagnosis.`;
+  }
+
+  if (report) {
+    return `In plain language about "${cleanedTerm || 'that'}": ${report.simplerSummary} ${report.whyExplanation} Remember, ${report.educationalDisclaimer}`;
+  }
+
+  if (observation) {
+    return `In plain language about "${cleanedTerm || 'that'}": ${observation.simplerSummary} What I observed is ${observation.whatICanObserve} Remember, this is only a visual description and not a medical diagnosis.`;
+  }
+
+  return 'I can explain any observation or recommendation in plain language once we capture a photograph or complete your symptom check. Say "Open camera" to examine your skin, or ask any question.';
+}
+
